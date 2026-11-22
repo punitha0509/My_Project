@@ -1,0 +1,131 @@
+"""
+Credit Card Fraud Detection with an AutoEncoder and PyOD.
+ 
+Run:
+    pip install -r requirements.txt
+    python fraud_detection.py --data creditcard.csv
+ 
+The model is trained only on legitimate transactions. The 99th percentile
+of reconstruction errors on a separate legitimate validation set is used
+as the anomaly threshold. The Class column is used only for evaluation.
+"""
+ 
+import argparse
+import time
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    confusion_matrix, precision_recall_fscore_support,
+    roc_auc_score, average_precision_score
+)
+ 
+RANDOM_STATE = 42
+TRAIN_NORMAL_ROWS = 20_000
+VALIDATION_NORMAL_ROWS = 5_000
+TEST_NORMAL_ROWS = 5_000
+EPOCHS = 20
+THRESHOLD_QUANTILE = 0.99
+ 
+ 
+def load_and_split_data(csv_path):
+    """Load data and create normal-only training/validation partitions."""
+    data = pd.read_csv(csv_path)
+    if "Class" not in data.columns:
+        raise ValueError("Dataset must contain a 'Class' column.")
+ 
+    features = [column for column in data.columns if column != "Class"]
+    normal = data[data["Class"] == 0].sample(frac=1, random_state=RANDOM_STATE)
+    fraud = data[data["Class"] == 1]
+ 
+    required = TRAIN_NORMAL_ROWS + VALIDATION_NORMAL_ROWS + TEST_NORMAL_ROWS
+    if len(normal) < required:
+        raise ValueError(f"Need at least {required} legitimate transactions.")
+ 
+    train = normal.iloc[:TRAIN_NORMAL_ROWS]
+    validation = normal.iloc[
+        TRAIN_NORMAL_ROWS:TRAIN_NORMAL_ROWS + VALIDATION_NORMAL_ROWS
+    ]
+    test_normal = normal.iloc[
+        TRAIN_NORMAL_ROWS + VALIDATION_NORMAL_ROWS:
+        TRAIN_NORMAL_ROWS + VALIDATION_NORMAL_ROWS + TEST_NORMAL_ROWS
+    ]
+    test = pd.concat([test_normal, fraud]).sample(frac=1, random_state=RANDOM_STATE)
+ 
+    # Fit preprocessing on training data only to prevent data leakage.
+    scaler = StandardScaler()
+    x_train = scaler.fit_transform(train[features].astype(np.float32))
+    x_validation = scaler.transform(validation[features].astype(np.float32))
+    x_test = scaler.transform(test[features].astype(np.float32))
+    y_test = test["Class"].to_numpy()
+ 
+    return x_train, x_validation, x_test, y_test
+ 
+ 
+def train_autoencoder(x_train):
+    """Train PyOD AutoEncoder on legitimate transaction feature vectors."""
+    from pyod.models.auto_encoder import AutoEncoder
+ 
+    detector = AutoEncoder(
+        hidden_neuron_list=[16, 8, 8, 16],
+        epoch_num=EPOCHS,
+        batch_size=256,
+        contamination=0.01,
+        preprocessing=False,
+        verbose=0,
+        random_state=RANDOM_STATE
+    )
+    detector.fit(x_train)
+    return detector
+ 
+ 
+def evaluate(detector, x_validation, x_test, y_test):
+    """Calibrate threshold on normal validation data and evaluate test data."""
+    validation_errors = detector.decision_function(x_validation)
+    test_errors = detector.decision_function(x_test)
+ 
+    # A high reconstruction error indicates an unusual transaction.
+    threshold = float(np.quantile(validation_errors, THRESHOLD_QUANTILE))
+    predictions = (test_errors > threshold).astype(int)
+ 
+    tn, fp, fn, tp = confusion_matrix(
+        y_test, predictions, labels=[0, 1]
+    ).ravel()
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_test, predictions, average="binary", zero_division=0
+    )
+ 
+    print("\n=== Fraud Detection Experiment ===")
+    print(f"Threshold (99th percentile): {threshold:.6f}")
+    print(f"True negatives:  {tn}")
+    print(f"False positives: {fp}")
+    print(f"False negatives: {fn}")
+    print(f"True positives:  {tp}")
+    print(f"Precision:       {precision:.4f}")
+    print(f"Recall:          {recall:.4f}")
+    print(f"F1-score:        {f1:.4f}")
+    print(f"ROC-AUC:         {roc_auc_score(y_test, test_errors):.4f}")
+    print(f"Average precision: {average_precision_score(y_test, test_errors):.4f}")
+ 
+ 
+def main():
+    parser = argparse.ArgumentParser(description="AutoEncoder fraud detection")
+    parser.add_argument(
+        "--data", default="creditcard.csv",
+        help="Path to the Kaggle credit card CSV dataset"
+    )
+    args = parser.parse_args()
+ 
+    start = time.time()
+    x_train, x_validation, x_test, y_test = load_and_split_data(args.data)
+    print(f"Training rows (legitimate only): {len(x_train)}")
+    print(f"Validation rows (legitimate only): {len(x_validation)}")
+    print(f"Test rows: {len(x_test)}")
+ 
+    detector = train_autoencoder(x_train)
+    evaluate(detector, x_validation, x_test, y_test)
+    print(f"Elapsed time: {time.time() - start:.2f} seconds")
+ 
+ 
+if __name__ == "__main__":
+    main()
